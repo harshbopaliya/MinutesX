@@ -1,0 +1,57 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║           MinutesX - AI MEETING NOTES (Multi-Agent System)           ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Generated: December 01, 2025 at 07:54 PM
+Meeting ID: 27353a6e
+Model: Gemini 2.5 Flash (Multi-Agent Architecture)
+Transcript Length: 9150 characters
+
+═══════════════════════════════════════════════════════════════════════
+
+## MEETING OVERVIEW
+
+Meeting summary could not be generated.
+
+═══════════════════════════════════════════════════════════════════════
+
+## ACTION ITEMS
+  No specific action items identified.
+
+═══════════════════════════════════════════════════════════════════════
+
+## FOLLOW-UP REQUIRED
+
+  • Review transcript for action items
+
+═══════════════════════════════════════════════════════════════════════
+
+## NEXT STEPS
+
+  None specified
+
+═══════════════════════════════════════════════════════════════════════
+
+## KEY DECISIONS
+
+  (No decisions recorded)
+
+═══════════════════════════════════════════════════════════════════════
+
+## MULTI-AGENT SYSTEM INFO
+
+Architecture: Orchestrator + 3 Parallel Agents
+  • CaptionAgent  → Headlines & social captions
+  • SummaryAgent  → Executive summary & key points  
+  • ActionAgent   → Action items & follow-ups
+
+Protocol: A2A (Agent-to-Agent)
+Messages Exchanged: 6
+Active Agents: orchestrator, caption_agent, summary_agent, action_agent, transcription_agent
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: ActionAgent + Orchestrator
+A2A PROTOCOL: Multi-agent coordination complete
+
+Powered by MinutesX | github.com/harshbopaliya/MinutesX

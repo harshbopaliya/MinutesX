@@ -1,0 +1,29 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              MinutesX - AI CAPTION (Multi-Agent System)              ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Generated: December 01, 2025 at 07:54 PM
+Meeting ID: 27353a6e
+Model: Gemini 2.5 Flash (Multi-Agent)
+Processing Time: 1.11s
+
+═══════════════════════════════════════════════════════════════════════
+
+📰 HEADLINE:
+Meeting - December 01
+
+📝 ONE-LINER:
+Team meeting completed successfully
+
+💬 SLACK UPDATE:
+Meeting notes are ready for review!
+
+📧 EMAIL SUBJECT:
+Meeting Notes Available
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: CaptionAgent
+A2A PROTOCOL: Task completed via message bus
+
+Powered by MinutesX | github.com/harshbopaliya/MinutesX

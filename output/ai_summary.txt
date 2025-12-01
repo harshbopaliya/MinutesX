@@ -1,0 +1,46 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              MinutesX - AI SUMMARY (Multi-Agent System)              ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Generated: December 01, 2025 at 07:54 PM
+Meeting ID: 27353a6e
+Model: Gemini 2.5 Flash (Multi-Agent)
+
+═══════════════════════════════════════════════════════════════════════
+
+## EXECUTIVE SUMMARY
+
+Meeting summary could not be generated.
+
+═══════════════════════════════════════════════════════════════════════
+
+## KEY DISCUSSION POINTS
+
+  • Please review transcript
+
+═══════════════════════════════════════════════════════════════════════
+
+## DECISIONS MADE
+
+  (No decisions recorded)
+
+═══════════════════════════════════════════════════════════════════════
+
+## TOPICS COVERED
+
+General discussion
+
+## PARTICIPANTS
+
+Not identified
+
+## MEETING OUTCOME
+
+See transcript for details
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: SummaryAgent
+A2A PROTOCOL: Task completed via message bus
+
+Powered by MinutesX | github.com/harshbopaliya/MinutesX

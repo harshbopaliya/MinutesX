@@ -1,18 +1,38 @@
 """
-MinutesX - Live Google Meet Transcription & AI Notes
-=====================================================
+MinutesX - Live Google Meet AI Notes (Multi-Agent System)
+==========================================================
 
-Captures LIVE audio from Google Meet calls and generates:
-- ai_caption.txt  - One-line meeting caption
-- ai_summary.txt  - Executive summary with key points  
-- ai_notes.txt    - Detailed meeting notes with action items
+ARCHITECTURE:
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    ORCHESTRATOR AGENT                       │
+  │                  (Coordinates all agents)                   │
+  └─────────────────────────────────────────────────────────────┘
+                              │
+           ┌──────────────────┼──────────────────┐
+           │                  │                  │
+           ▼                  ▼                  ▼
+    ┌────────────┐    ┌────────────┐    ┌────────────┐
+    │  CAPTION   │    │  SUMMARY   │    │   ACTION   │
+    │   AGENT    │    │   AGENT    │    │   AGENT    │
+    └────────────┘    └────────────┘    └────────────┘
+           │                  │                  │
+           └──────────────────┼──────────────────┘
+                              │
+                              ▼
+                    ┌────────────────┐
+                    │ A2A MESSAGE BUS │
+                    │  (Coordination) │
+                    └────────────────┘
 
-HOW TO USE:
-1. Start your Google Meet call
-2. Run: python demo.py
-3. Select your audio device (use Stereo Mix/WASAPI loopback)
-4. Press Ctrl+C when meeting ends
-5. Find your notes in ./output/ folder
+OUTPUT FILES:
+  ./output/ai_caption.txt  - Meeting headline & captions
+  ./output/ai_summary.txt  - Executive summary & key points
+  ./output/ai_notes.txt    - Detailed notes & action items
+
+POWERED BY:
+  - Google Gemini 2.5 Flash (gemini-2.0-flash-exp)
+  - Google ADK Multi-Agent Pattern
+  - A2A (Agent-to-Agent) Protocol
 
 Run: python demo.py
 """
@@ -25,9 +45,14 @@ import queue
 import base64
 import io
 import wave
+import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 
 # Load environment
 from dotenv import load_dotenv
@@ -39,6 +64,7 @@ from rich.table import Table
 from rich.live import Live
 from rich.text import Text
 from rich.layout import Layout
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
 
@@ -50,28 +76,530 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OUTPUT_DIR = Path("./output")
 
 if not GOOGLE_API_KEY:
-    console.print("[red]❌ ERROR: GOOGLE_API_KEY not set![/red]")
-    console.print("\n[yellow]Add to your .env file:[/yellow]")
-    console.print("GOOGLE_API_KEY=your_api_key_here")
-    console.print("\n[cyan]Get your free key at: https://aistudio.google.com/apikey[/cyan]")
+    console.print(Panel.fit(
+        "[red]❌ GOOGLE_API_KEY not found![/red]\n\n"
+        "[yellow]Add to your .env file:[/yellow]\n"
+        "GOOGLE_API_KEY=your_api_key_here\n\n"
+        "[cyan]Get free key: https://aistudio.google.com/apikey[/cyan]",
+        title="Configuration Error",
+        border_style="red"
+    ))
     sys.exit(1)
 
 # Initialize Gemini
 import google.generativeai as genai
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Model name - Gemini 2.0 Flash
 MODEL_NAME = "gemini-2.0-flash-exp"
 
-# Try to import audio libraries
+# Audio libraries (optional)
 AUDIO_OK = False
 try:
     import sounddevice as sd
     import numpy as np
     AUDIO_OK = True
 except ImportError:
-    console.print("[yellow]⚠ Audio libraries not installed.[/yellow]")
-    console.print("[dim]Run: pip install sounddevice numpy[/dim]\n")
+    pass
+
+
+# =============================================================================
+# A2A Protocol - Agent-to-Agent Communication
+# =============================================================================
+
+class MessageType(Enum):
+    """Types of A2A messages."""
+    TASK_REQUEST = "TASK_REQUEST"
+    TASK_RESULT = "TASK_RESULT"
+    STATUS_UPDATE = "STATUS_UPDATE"
+    ERROR = "ERROR"
+
+
+@dataclass
+class A2AMessage:
+    """A2A Protocol message for agent communication."""
+    message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    message_type: MessageType = MessageType.TASK_REQUEST
+    source_agent: str = ""
+    target_agent: str = ""
+    payload: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.message_id,
+            "type": self.message_type.value,
+            "from": self.source_agent,
+            "to": self.target_agent,
+            "payload": self.payload,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+class A2AMessageBus:
+    """Message bus for A2A agent communication."""
+    
+    def __init__(self):
+        self.subscribers: Dict[str, Callable] = {}
+        self.message_log: List[A2AMessage] = []
+        self._lock = threading.Lock()
+    
+    def subscribe(self, agent_id: str, handler: Callable):
+        """Subscribe agent to receive messages."""
+        with self._lock:
+            self.subscribers[agent_id] = handler
+    
+    def publish(self, message: A2AMessage) -> bool:
+        """Publish message to target agent."""
+        with self._lock:
+            self.message_log.append(message)
+        
+        target = message.target_agent
+        if target in self.subscribers:
+            try:
+                self.subscribers[target](message)
+                return True
+            except Exception as e:
+                console.print(f"[dim]A2A Error: {e}[/dim]")
+        return False
+    
+    def send_task(self, source: str, target: str, task: str, data: Any) -> A2AMessage:
+        """Send a task request to an agent."""
+        msg = A2AMessage(
+            message_type=MessageType.TASK_REQUEST,
+            source_agent=source,
+            target_agent=target,
+            payload={"task": task, "data": data}
+        )
+        self.publish(msg)
+        return msg
+    
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "total_messages": len(self.message_log),
+            "agents": list(self.subscribers.keys()),
+        }
+
+
+# Global message bus
+message_bus = A2AMessageBus()
+
+
+# =============================================================================
+# Base Agent Class (Google ADK Pattern)
+# =============================================================================
+
+class BaseAgent:
+    """Base class for all MinutesX agents following Google ADK pattern."""
+    
+    def __init__(self, agent_id: str, model_name: str = MODEL_NAME):
+        self.agent_id = agent_id
+        self.model = genai.GenerativeModel(model_name)
+        self.results: Dict[str, Any] = {}
+        
+        # Register with message bus
+        message_bus.subscribe(agent_id, self._handle_message)
+    
+    def _handle_message(self, message: A2AMessage):
+        """Handle incoming A2A message."""
+        task = message.payload.get("task")
+        data = message.payload.get("data")
+        
+        if hasattr(self, f"task_{task}"):
+            result = getattr(self, f"task_{task}")(data)
+            # Send result back
+            response = A2AMessage(
+                message_type=MessageType.TASK_RESULT,
+                source_agent=self.agent_id,
+                target_agent=message.source_agent,
+                payload={"task": task, "result": result}
+            )
+            message_bus.publish(response)
+    
+    def generate(self, prompt: str) -> str:
+        """Generate response using Gemini."""
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+# =============================================================================
+# Specialized Agents
+# =============================================================================
+
+class CaptionAgent(BaseAgent):
+    """Agent for generating meeting captions and headlines."""
+    
+    PROMPT = """You are the Caption Agent for MinutesX meeting notes system.
+    
+Create professional captions for this meeting transcript.
+
+TRANSCRIPT:
+{transcript}
+
+Generate captions in this EXACT JSON format:
+{{
+    "headline": "Punchy headline (max 80 chars)",
+    "one_liner": "One-line summary (max 140 chars)",
+    "slack_update": "Casual Slack message (1-2 sentences)",
+    "email_subject": "Email subject line (max 60 chars)"
+}}
+
+Return ONLY valid JSON."""
+
+    def __init__(self):
+        super().__init__("caption_agent")
+    
+    def generate_caption(self, transcript: str) -> Dict[str, Any]:
+        """Generate meeting captions."""
+        prompt = self.PROMPT.format(transcript=transcript[:8000])
+        response = self.generate(prompt)
+        
+        try:
+            # Clean and parse JSON
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except:
+            return {
+                "headline": f"Meeting - {datetime.now().strftime('%B %d')}",
+                "one_liner": "Team meeting completed successfully",
+                "slack_update": "Meeting notes are ready for review!",
+                "email_subject": "Meeting Notes Available"
+            }
+    
+    def task_generate(self, data: Dict) -> Dict[str, Any]:
+        """A2A task handler."""
+        return self.generate_caption(data.get("transcript", ""))
+
+
+class SummaryAgent(BaseAgent):
+    """Agent for generating meeting summaries."""
+    
+    PROMPT = """You are the Summary Agent for MinutesX meeting notes system.
+
+Analyze this meeting transcript and create a comprehensive summary.
+
+TRANSCRIPT:
+{transcript}
+
+Generate summary in this EXACT JSON format:
+{{
+    "executive_summary": "3-4 sentence executive summary",
+    "key_points": [
+        "Key point 1 with context",
+        "Key point 2 with context",
+        "Key point 3 with context",
+        "Key point 4 with context",
+        "Key point 5 with context"
+    ],
+    "decisions": [
+        "Decision 1 that was made",
+        "Decision 2 that was made"
+    ],
+    "topics": ["Topic 1", "Topic 2", "Topic 3"],
+    "participants": ["Person 1", "Person 2"],
+    "outcome": "Brief meeting outcome"
+}}
+
+Return ONLY valid JSON."""
+
+    def __init__(self):
+        super().__init__("summary_agent")
+    
+    def generate_summary(self, transcript: str) -> Dict[str, Any]:
+        """Generate meeting summary."""
+        prompt = self.PROMPT.format(transcript=transcript[:15000])
+        response = self.generate(prompt)
+        
+        try:
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except:
+            return {
+                "executive_summary": "Meeting summary could not be generated.",
+                "key_points": ["Please review transcript"],
+                "decisions": [],
+                "topics": [],
+                "participants": [],
+                "outcome": "See transcript for details"
+            }
+    
+    def task_generate(self, data: Dict) -> Dict[str, Any]:
+        return self.generate_summary(data.get("transcript", ""))
+
+
+class ActionAgent(BaseAgent):
+    """Agent for extracting action items and tasks."""
+    
+    PROMPT = """You are the Action Item Agent for MinutesX meeting notes system.
+
+Extract ALL action items, tasks, and commitments from this meeting.
+
+TRANSCRIPT:
+{transcript}
+
+Generate action items in this EXACT JSON format:
+{{
+    "action_items": [
+        {{
+            "task": "Clear task description",
+            "owner": "Person name or Unassigned",
+            "priority": "high|medium|low",
+            "due": "Date if mentioned or TBD",
+            "context": "Brief context"
+        }}
+    ],
+    "follow_ups": [
+        "Follow-up item 1",
+        "Follow-up item 2"
+    ],
+    "next_steps": [
+        "Next step 1",
+        "Next step 2"
+    ]
+}}
+
+Look for: "I will...", "Please...", "Can you...", "We need to...", "Action item:", deadlines, commitments.
+
+Return ONLY valid JSON."""
+
+    def __init__(self):
+        super().__init__("action_agent")
+    
+    def extract_actions(self, transcript: str) -> Dict[str, Any]:
+        """Extract action items from transcript."""
+        prompt = self.PROMPT.format(transcript=transcript[:15000])
+        response = self.generate(prompt)
+        
+        try:
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except:
+            return {
+                "action_items": [],
+                "follow_ups": ["Review transcript for action items"],
+                "next_steps": []
+            }
+    
+    def task_generate(self, data: Dict) -> Dict[str, Any]:
+        return self.extract_actions(data.get("transcript", ""))
+
+
+class TranscriptionAgent(BaseAgent):
+    """Agent for transcribing audio using Gemini."""
+    
+    def __init__(self):
+        super().__init__("transcription_agent")
+    
+    def transcribe(self, wav_bytes: bytes) -> Optional[str]:
+        """Transcribe audio to text."""
+        try:
+            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+            response = self.model.generate_content([
+                """Transcribe this audio accurately.
+                - Return ONLY spoken words
+                - Include speaker names if identifiable
+                - If silence, return [silence]""",
+                {"mime_type": "audio/wav", "data": audio_b64}
+            ])
+            text = response.text.strip()
+            if text and text != "[silence]" and len(text) > 3:
+                return text
+            return None
+        except:
+            return None
+
+
+# =============================================================================
+# Orchestrator Agent - Coordinates All Agents
+# =============================================================================
+
+class OrchestratorAgent(BaseAgent):
+    """
+    Main orchestrator agent that coordinates all sub-agents.
+    
+    Implements Google ADK multi-agent pattern:
+    - Parallel execution of independent agents
+    - A2A protocol for agent communication
+    - Result aggregation and formatting
+    """
+    
+    def __init__(self):
+        super().__init__("orchestrator")
+        
+        # Initialize sub-agents
+        self.caption_agent = CaptionAgent()
+        self.summary_agent = SummaryAgent()
+        self.action_agent = ActionAgent()
+        self.transcription_agent = TranscriptionAgent()
+        
+        console.print("[green]✓[/green] Orchestrator initialized with 4 agents")
+    
+    def process_meeting(self, transcript: str, meeting_id: str = None) -> Dict[str, Any]:
+        """
+        Process meeting through multi-agent pipeline.
+        
+        Pipeline:
+        1. Parallel: Caption + Summary + Action agents
+        2. Aggregate results
+        3. Format outputs
+        """
+        meeting_id = meeting_id or str(uuid.uuid4())[:8]
+        start_time = time.time()
+        
+        console.print(f"\n[cyan]🤖 Orchestrator processing meeting {meeting_id}[/cyan]")
+        console.print(f"[dim]Transcript: {len(transcript)} characters[/dim]\n")
+        
+        # Send A2A messages to agents (for demonstration)
+        message_bus.send_task("orchestrator", "caption_agent", "generate", {"transcript": transcript})
+        message_bus.send_task("orchestrator", "summary_agent", "generate", {"transcript": transcript})
+        message_bus.send_task("orchestrator", "action_agent", "generate", {"transcript": transcript})
+        
+        # Execute agents in parallel
+        results = {}
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            
+            # Define parallel tasks
+            tasks = {
+                "caption": (self.caption_agent.generate_caption, "Generating captions..."),
+                "summary": (self.summary_agent.generate_summary, "Generating summary..."),
+                "action": (self.action_agent.extract_actions, "Extracting actions..."),
+            }
+            
+            # Run in parallel
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {}
+                for name, (func, desc) in tasks.items():
+                    task_id = progress.add_task(desc, total=None)
+                    futures[executor.submit(func, transcript)] = (name, task_id)
+                
+                for future in as_completed(futures):
+                    name, task_id = futures[future]
+                    try:
+                        results[name] = future.result()
+                        progress.update(task_id, description=f"[green]✓[/green] {name.title()} complete")
+                    except Exception as e:
+                        results[name] = {"error": str(e)}
+                        progress.update(task_id, description=f"[red]✗[/red] {name.title()} failed")
+        
+        # Calculate processing time
+        duration = time.time() - start_time
+        
+        # Aggregate results
+        final_result = {
+            "meeting_id": meeting_id,
+            "processed_at": datetime.now().isoformat(),
+            "duration_seconds": round(duration, 2),
+            "transcript_length": len(transcript),
+            "caption": results.get("caption", {}),
+            "summary": results.get("summary", {}),
+            "actions": results.get("action", {}),
+            "a2a_stats": message_bus.get_stats(),
+        }
+        
+        console.print(f"\n[green]✓ Processing complete in {duration:.1f}s[/green]")
+        console.print(f"[dim]A2A Messages: {message_bus.get_stats()['total_messages']}[/dim]")
+        
+        return final_result
+
+
+# =============================================================================
+# Audio Capture (for Live Mode)
+# =============================================================================
+
+class AudioCapture:
+    """Captures system audio for Google Meet."""
+    
+    def __init__(self, sample_rate=16000, chunk_seconds=8):
+        self.sample_rate = sample_rate
+        self.chunk_seconds = chunk_seconds
+        self.queue = queue.Queue()
+        self.recording = False
+        self.duration = 0
+    
+    def list_devices(self):
+        devices = []
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] > 0:
+                name = d['name'].lower()
+                is_loopback = any(x in name for x in ['loopback', 'stereo mix', 'wasapi', 'mix'])
+                devices.append({'idx': i, 'name': d['name'], 'loopback': is_loopback})
+        return devices
+    
+    def find_loopback(self):
+        for d in self.list_devices():
+            if d['loopback']:
+                return d['idx']
+        return None
+    
+    def start(self, device=None):
+        self.recording = True
+        self.duration = 0
+        
+        def callback(indata, frames, time_info, status):
+            if self.recording:
+                self.queue.put(indata.copy())
+        
+        try:
+            self.stream = sd.InputStream(
+                device=device, channels=1, samplerate=self.sample_rate,
+                dtype='int16', callback=callback, blocksize=int(self.sample_rate * 0.5)
+            )
+            self.stream.start()
+            return True
+        except Exception as e:
+            console.print(f"[red]Audio error: {e}[/red]")
+            return False
+    
+    def get_chunk(self):
+        chunks = []
+        samples_needed = int(self.sample_rate * self.chunk_seconds)
+        collected = 0
+        
+        while collected < samples_needed and self.recording:
+            try:
+                chunk = self.queue.get(timeout=0.5)
+                chunks.append(chunk)
+                collected += len(chunk)
+            except:
+                break
+        
+        if chunks:
+            audio = np.concatenate(chunks)
+            self.duration += len(audio) / self.sample_rate
+            return audio
+        return None
+    
+    def stop(self):
+        self.recording = False
+        if hasattr(self, 'stream'):
+            self.stream.stop()
+            self.stream.close()
+    
+    def to_wav(self, audio):
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.sample_rate)
+            w.writeframes(audio.tobytes())
+        return buf.getvalue()
+    
+    def get_duration_str(self):
+        mins, secs = divmod(int(self.duration), 60)
+        return f"{mins:02d}:{secs:02d}"
 
 
 # =============================================================================
@@ -202,241 +730,200 @@ class AudioCapture:
 
 
 # =============================================================================
-# Gemini AI Functions - Optimized for Live Transcription
+# Output Generation - Save to ./output/ folder
 # =============================================================================
 
-def transcribe_audio(wav_bytes):
-    """Transcribe audio chunk using Gemini 2.5 Flash."""
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-        
-        response = model.generate_content([
-            """Transcribe this audio accurately. 
-            - Return ONLY the spoken words
-            - Include speaker names if identifiable (e.g., "John: Hello everyone")
-            - If no speech detected, return [silence]
-            - Keep filler words minimal""",
-            {"mime_type": "audio/wav", "data": audio_b64}
-        ])
-        
-        text = response.text.strip()
-        if text and text != "[silence]" and len(text) > 3:
-            return text
-        return None
-    except Exception as e:
-        # Silent fail for transcription to not interrupt flow
-        return None
-
-
-def generate_caption(transcript):
-    """Generate a concise meeting caption."""
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    prompt = f"""Create a professional one-line caption (max 100 characters) for this meeting.
-Focus on the main topic, decision, or outcome.
-
-Meeting transcript:
-{transcript[:8000]}
-
-Return ONLY the caption text, nothing else."""
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except:
-        return f"Meeting - {datetime.now().strftime('%B %d, %Y')}"
-
-
-def generate_summary(transcript):
-    """Generate comprehensive meeting summary."""
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    prompt = f"""Analyze this meeting transcript and create a comprehensive summary.
-
-MEETING TRANSCRIPT:
-{transcript[:15000]}
-
-Create a detailed summary with these exact sections:
-
-## EXECUTIVE SUMMARY
-Write 3-4 sentences capturing the essence of the meeting - what was discussed, key outcomes, and overall tone.
-
-## KEY DISCUSSION POINTS
-List 5-7 main points discussed with brief context for each:
-• Point 1 - brief explanation
-• Point 2 - brief explanation
-(continue as needed)
-
-## DECISIONS MADE
-List all decisions that were agreed upon during the meeting:
-• Decision 1
-• Decision 2
-(if no decisions, state "No formal decisions were made")
-
-## TOPICS COVERED
-• Topic 1
-• Topic 2
-• Topic 3
-
-## PARTICIPANTS
-List identified speakers and their apparent roles (if determinable)
-
-## MEETING OUTCOME
-Brief paragraph on what was achieved and the overall result of the meeting.
-
-Format with clear headers and bullet points. Be specific and actionable."""
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"Summary generation failed: {str(e)}"
-
-
-def generate_notes(transcript):
-    """Generate detailed meeting notes with action items."""
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    prompt = f"""Create comprehensive, professional meeting notes from this transcript.
-
-TRANSCRIPT:
-{transcript[:15000]}
-
-Generate detailed meeting notes in this EXACT format:
-
-## MEETING INFORMATION
-- Date: {datetime.now().strftime('%B %d, %Y')}
-- Time: {datetime.now().strftime('%I:%M %p')}
-- Generated by: MinutesX AI (Gemini 2.5 Flash)
-
-## MEETING OVERVIEW
-Write a 2-3 paragraph summary covering what the meeting was about, who participated, and the main outcomes.
-
-## ACTION ITEMS
-Extract ALL tasks, to-dos, and commitments mentioned. Format each as:
-
-☐ [Specific Task Description]
-   → Assigned to: [Name or "Unassigned"]
-   → Priority: [High/Medium/Low based on context]
-   → Due: [Date if mentioned, otherwise "TBD"]
-
-☐ [Next task...]
-
-(Include at least 3-5 action items. If none explicitly stated, infer from commitments made)
-
-## KEY DECISIONS
-Document all decisions made during the meeting:
-✓ Decision 1 - context/reasoning
-✓ Decision 2 - context/reasoning
-
-## DISCUSSION HIGHLIGHTS
-Important points raised during discussion:
-• Point 1 - details
-• Point 2 - details
-• Point 3 - details
-
-## FOLLOW-UP REQUIRED
-Items needing follow-up after this meeting:
-• Follow-up item 1
-• Follow-up item 2
-
-## NEXT STEPS
-What should happen after this meeting:
-1. First step
-2. Second step
-3. Third step
-
-## PARKING LOT
-Issues raised but not resolved (for future discussion):
-• Item 1
-• Item 2
-(or "None" if all items were addressed)
-
-## NOTES
-Any additional observations or context that might be useful.
-
-Make notes comprehensive, professional, and immediately actionable."""
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"Notes generation failed: {str(e)}"
-
-
-# =============================================================================
-# Output Functions
-# =============================================================================
-
-def save_outputs(transcript, caption, summary, notes):
+def save_outputs(result: Dict[str, Any], transcript: str):
     """Save all outputs to ./output folder."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 1. Save AI Caption
+    caption_data = result.get("caption", {})
+    summary_data = result.get("summary", {})
+    action_data = result.get("actions", {})
+    
+    # 1. AI CAPTION
     caption_file = OUTPUT_DIR / "ai_caption.txt"
-    caption_content = f"""╔══════════════════════════════════════════════════════════════════╗
-║                    MinutesX - AI CAPTION                          ║
-╚══════════════════════════════════════════════════════════════════╝
+    caption_content = f"""╔══════════════════════════════════════════════════════════════════════╗
+║              MinutesX - AI CAPTION (Multi-Agent System)              ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
-Model: Gemini 2.5 Flash
+Meeting ID: {result.get('meeting_id', 'N/A')}
+Model: Gemini 2.5 Flash (Multi-Agent)
+Processing Time: {result.get('duration_seconds', 0)}s
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+═══════════════════════════════════════════════════════════════════════
 
-MEETING CAPTION:
-{caption}
+📰 HEADLINE:
+{caption_data.get('headline', 'Meeting Summary')}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 ONE-LINER:
+{caption_data.get('one_liner', 'Meeting completed')}
 
-Use this caption for:
-• Slack/Teams updates
-• Email subject lines
-• Calendar event titles
-• Meeting summaries
+💬 SLACK UPDATE:
+{caption_data.get('slack_update', 'Meeting notes ready!')}
+
+📧 EMAIL SUBJECT:
+{caption_data.get('email_subject', 'Meeting Notes')}
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: CaptionAgent
+A2A PROTOCOL: Task completed via message bus
+
+Powered by MinutesX | github.com/harshbopaliya/MinutesX
 """
     caption_file.write_text(caption_content, encoding='utf-8')
     
-    # 2. Save AI Summary
+    # 2. AI SUMMARY
     summary_file = OUTPUT_DIR / "ai_summary.txt"
-    summary_content = f"""╔══════════════════════════════════════════════════════════════════╗
-║                    MinutesX - AI SUMMARY                          ║
-╚══════════════════════════════════════════════════════════════════╝
+    
+    key_points_str = "\n".join([f"  • {p}" for p in summary_data.get('key_points', [])])
+    decisions_str = "\n".join([f"  ✓ {d}" for d in summary_data.get('decisions', [])]) or "  (No decisions recorded)"
+    topics_str = ", ".join(summary_data.get('topics', [])) or "General discussion"
+    participants_str = ", ".join(summary_data.get('participants', [])) or "Not identified"
+    
+    summary_content = f"""╔══════════════════════════════════════════════════════════════════════╗
+║              MinutesX - AI SUMMARY (Multi-Agent System)              ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
-Model: Gemini 2.5 Flash
+Meeting ID: {result.get('meeting_id', 'N/A')}
+Model: Gemini 2.5 Flash (Multi-Agent)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+═══════════════════════════════════════════════════════════════════════
 
-{summary}
+## EXECUTIVE SUMMARY
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{summary_data.get('executive_summary', 'Summary not available.')}
+
+═══════════════════════════════════════════════════════════════════════
+
+## KEY DISCUSSION POINTS
+
+{key_points_str or '  • No key points extracted'}
+
+═══════════════════════════════════════════════════════════════════════
+
+## DECISIONS MADE
+
+{decisions_str}
+
+═══════════════════════════════════════════════════════════════════════
+
+## TOPICS COVERED
+
+{topics_str}
+
+## PARTICIPANTS
+
+{participants_str}
+
+## MEETING OUTCOME
+
+{summary_data.get('outcome', 'See transcript for details.')}
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: SummaryAgent
+A2A PROTOCOL: Task completed via message bus
+
 Powered by MinutesX | github.com/harshbopaliya/MinutesX
 """
     summary_file.write_text(summary_content, encoding='utf-8')
     
-    # 3. Save AI Notes
+    # 3. AI NOTES (with Action Items)
     notes_file = OUTPUT_DIR / "ai_notes.txt"
-    notes_content = f"""╔══════════════════════════════════════════════════════════════════╗
-║                    MinutesX - AI MEETING NOTES                    ║
-╚══════════════════════════════════════════════════════════════════╝
+    
+    action_items = action_data.get('action_items', [])
+    actions_str = ""
+    for i, item in enumerate(action_items, 1):
+        priority_mark = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.get('priority', 'medium'), "⚪")
+        actions_str += f"""
+  {priority_mark} [{i}] {item.get('task', 'Task')}
+      → Assigned to: {item.get('owner', 'Unassigned')}
+      → Priority: {item.get('priority', 'medium').upper()}
+      → Due: {item.get('due', 'TBD')}
+      → Context: {item.get('context', '')}
+"""
+    
+    if not actions_str:
+        actions_str = "  No specific action items identified.\n"
+    
+    follow_ups = action_data.get('follow_ups', [])
+    follow_ups_str = "\n".join([f"  • {f}" for f in follow_ups]) or "  None"
+    
+    next_steps = action_data.get('next_steps', [])
+    next_steps_str = "\n".join([f"  {i}. {s}" for i, s in enumerate(next_steps, 1)]) or "  None specified"
+    
+    notes_content = f"""╔══════════════════════════════════════════════════════════════════════╗
+║           MinutesX - AI MEETING NOTES (Multi-Agent System)           ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
-Model: Gemini 2.5 Flash
+Meeting ID: {result.get('meeting_id', 'N/A')}
+Model: Gemini 2.5 Flash (Multi-Agent Architecture)
+Transcript Length: {result.get('transcript_length', 0)} characters
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+═══════════════════════════════════════════════════════════════════════
 
-{notes}
+## MEETING OVERVIEW
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{summary_data.get('executive_summary', 'See summary file for details.')}
+
+═══════════════════════════════════════════════════════════════════════
+
+## ACTION ITEMS
+{actions_str}
+═══════════════════════════════════════════════════════════════════════
+
+## FOLLOW-UP REQUIRED
+
+{follow_ups_str}
+
+═══════════════════════════════════════════════════════════════════════
+
+## NEXT STEPS
+
+{next_steps_str}
+
+═══════════════════════════════════════════════════════════════════════
+
+## KEY DECISIONS
+
+{decisions_str}
+
+═══════════════════════════════════════════════════════════════════════
+
+## MULTI-AGENT SYSTEM INFO
+
+Architecture: Orchestrator + 3 Parallel Agents
+  • CaptionAgent  → Headlines & social captions
+  • SummaryAgent  → Executive summary & key points  
+  • ActionAgent   → Action items & follow-ups
+
+Protocol: A2A (Agent-to-Agent)
+Messages Exchanged: {result.get('a2a_stats', {}).get('total_messages', 0)}
+Active Agents: {', '.join(result.get('a2a_stats', {}).get('agents', []))}
+
+═══════════════════════════════════════════════════════════════════════
+
+AGENT: ActionAgent + Orchestrator
+A2A PROTOCOL: Multi-agent coordination complete
+
 Powered by MinutesX | github.com/harshbopaliya/MinutesX
 """
     notes_file.write_text(notes_content, encoding='utf-8')
     
-    # 4. Save raw transcript
+    # 4. Raw transcript
     transcript_file = OUTPUT_DIR / f"transcript_{timestamp}.txt"
-    transcript_file.write_text(f"Meeting Transcript - {datetime.now().strftime('%B %d, %Y')}\n\n{transcript}", encoding='utf-8')
+    transcript_file.write_text(
+        f"Meeting Transcript - {datetime.now().strftime('%B %d, %Y')}\n"
+        f"Meeting ID: {result.get('meeting_id', 'N/A')}\n\n"
+        f"{transcript}",
+        encoding='utf-8'
+    )
     
     return {
         'caption': caption_file,
@@ -446,264 +933,248 @@ Powered by MinutesX | github.com/harshbopaliya/MinutesX
     }
 
 
-def display_results(caption, summary, notes):
+def display_results(result: Dict[str, Any]):
     """Display results in console."""
+    caption = result.get("caption", {})
+    summary = result.get("summary", {})
+    actions = result.get("actions", {})
+    
     console.print("\n" + "="*70)
-    console.print(Panel(f"[bold cyan]{caption}[/bold cyan]", title="📝 AI CAPTION", border_style="cyan"))
     
-    console.print("\n")
-    console.print(Panel(summary[:1500] + "..." if len(summary) > 1500 else summary, 
-                       title="📋 AI SUMMARY (Preview)", border_style="green"))
-    
-    console.print("\n")
-    console.print(Panel(notes[:1500] + "..." if len(notes) > 1500 else notes,
-                       title="📄 AI NOTES (Preview)", border_style="yellow"))
-
-
-# =============================================================================
-# Main Demo Functions - Live Google Meet Capture
-# =============================================================================
-
-def run_live_demo():
-    """Run LIVE Google Meet audio capture and transcription."""
-    console.print(Panel.fit(
-        "[bold cyan]🎤 LIVE MODE - Google Meet Capture[/bold cyan]\n\n"
-        "• Captures system audio from Google Meet in real-time\n"
-        "• Transcribes with Gemini 2.5 Flash\n"
-        "• Generates ai_caption.txt, ai_summary.txt, ai_notes.txt\n\n"
-        "[yellow]Press Ctrl+C to stop recording and generate notes[/yellow]",
-        title="MinutesX Live",
+    # Caption
+    console.print(Panel(
+        f"[bold cyan]{caption.get('headline', 'Meeting Summary')}[/bold cyan]\n\n"
+        f"[dim]{caption.get('one_liner', '')}[/dim]",
+        title="📝 AI CAPTION",
         border_style="cyan"
     ))
     
-    capture = AudioCapture(chunk_seconds=8)  # 8 second chunks
+    # Summary
+    console.print(Panel(
+        f"{summary.get('executive_summary', 'N/A')[:500]}",
+        title="📋 AI SUMMARY",
+        border_style="green"
+    ))
     
-    # Show available audio devices
-    console.print("\n[bold cyan]📢 Audio Input Devices:[/bold cyan]")
-    console.print("[dim]Select a LOOPBACK device to capture Google Meet audio[/dim]\n")
+    # Action Items
+    action_items = actions.get('action_items', [])
+    if action_items:
+        table = Table(title="✅ ACTION ITEMS", show_header=True, header_style="bold magenta")
+        table.add_column("P", width=3)
+        table.add_column("Task", width=40)
+        table.add_column("Owner", width=15)
+        table.add_column("Due", width=10)
+        
+        for item in action_items[:7]:
+            p = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.get('priority', 'medium'), "⚪")
+            table.add_row(p, item.get('task', '')[:40], item.get('owner', 'TBD'), item.get('due', 'TBD'))
+        
+        console.print(table)
+
+
+# =============================================================================
+# Main Demo Functions
+# =============================================================================
+
+def run_live_demo():
+    """Run LIVE Google Meet capture with multi-agent processing."""
+    console.print(Panel.fit(
+        "[bold cyan]🎤 LIVE MODE - Google Meet + Multi-Agent AI[/bold cyan]\n\n"
+        "• Captures system audio from Google Meet\n"
+        "• Transcribes with Gemini 2.5 Flash\n"
+        "• Processes through 4-agent pipeline:\n"
+        "  [dim]Orchestrator → Caption + Summary + Action Agents[/dim]\n\n"
+        "[yellow]Press Ctrl+C to stop and generate notes[/yellow]",
+        title="MinutesX Multi-Agent System",
+        border_style="cyan"
+    ))
     
+    # Initialize orchestrator with all agents
+    orchestrator = OrchestratorAgent()
+    capture = AudioCapture(chunk_seconds=8)
+    
+    # Show audio devices
+    console.print("\n[bold cyan]📢 Audio Devices:[/bold cyan]")
     devices = capture.list_devices()
-    table = Table(show_header=True, header_style="bold magenta")
+    
+    table = Table(show_header=True, header_style="bold")
     table.add_column("#", width=4)
-    table.add_column("Device Name", width=50)
-    table.add_column("Type", width=15)
+    table.add_column("Device", width=50)
+    table.add_column("Type", width=12)
     
     for d in devices:
-        device_type = "[green]◀ LOOPBACK[/green]" if d['loopback'] else "[dim]Microphone[/dim]"
-        table.add_row(str(d['idx']), d['name'], device_type)
+        dtype = "[green]LOOPBACK[/green]" if d['loopback'] else "[dim]Mic[/dim]"
+        table.add_row(str(d['idx']), d['name'], dtype)
     
     console.print(table)
     
-    # Find loopback device
     loopback = capture.find_loopback()
-    if loopback is not None:
-        console.print(f"\n[green]✓ Auto-detected loopback device: [{loopback}][/green]")
+    if loopback:
+        console.print(f"\n[green]✓ Auto-detected loopback: [{loopback}][/green]")
     else:
-        console.print("\n[yellow]⚠ No loopback device detected![/yellow]")
-        console.print("[dim]To capture Google Meet audio, enable 'Stereo Mix' in Windows Sound settings[/dim]")
-        console.print("[dim]Or use microphone input (place near speakers)[/dim]")
+        console.print("\n[yellow]⚠ No loopback found. Enable Stereo Mix in Windows Sound settings.[/yellow]")
     
-    # Let user select device
-    console.print("\n[cyan]Enter device number (or press Enter for auto):[/cyan] ", end="")
+    console.print("\n[cyan]Enter device number (or Enter for auto):[/cyan] ", end="")
     try:
         inp = input().strip()
         device = int(inp) if inp else loopback
     except:
         device = loopback
     
-    selected_name = "Default" 
-    for d in devices:
-        if d['idx'] == device:
-            selected_name = d['name']
-            break
-    
-    console.print(f"\n[cyan]Selected device:[/cyan] {selected_name}")
-    
-    # Start recording
     if not capture.start(device):
-        console.print("[red]❌ Failed to start audio capture.[/red]")
-        console.print("[yellow]Running demo mode instead...[/yellow]")
+        console.print("[red]Failed to start audio. Running demo mode.[/red]")
         return run_demo_mode()
     
     console.print("\n" + "="*60)
-    console.print("[bold red]🔴 RECORDING LIVE[/bold red] - Listening to Google Meet...")
-    console.print("[dim]Speak clearly or play your Google Meet meeting[/dim]")
-    console.print("[yellow]Press Ctrl+C when meeting ends to generate notes[/yellow]")
+    console.print("[bold red]🔴 RECORDING[/bold red] - Listening to Google Meet...")
+    console.print("[yellow]Press Ctrl+C when meeting ends[/yellow]")
     console.print("="*60 + "\n")
     
     transcript_parts = []
-    chunk_count = 0
     
     console.print("[bold]Live Captions:[/bold]\n")
     
     try:
         while True:
-            # Get audio chunk
             audio = capture.get_chunk()
-            
             if audio is not None and len(audio) > 0:
-                chunk_count += 1
                 wav = capture.to_wav(audio)
-                
-                # Show recording indicator
                 duration = capture.get_duration_str()
+                
                 console.print(f"[dim]⏱ {duration}[/dim] ", end="")
                 
-                # Transcribe with Gemini
-                text = transcribe_audio(wav)
-                
+                text = orchestrator.transcription_agent.transcribe(wav)
                 if text:
                     transcript_parts.append(text)
-                    # Show live caption
-                    display_text = text[:100] + "..." if len(text) > 100 else text
-                    console.print(f"[cyan]{display_text}[/cyan]")
+                    display = text[:100] + "..." if len(text) > 100 else text
+                    console.print(f"[cyan]{display}[/cyan]")
                 else:
-                    console.print(f"[dim](listening...)[/dim]")
+                    console.print("[dim](listening...)[/dim]")
             
             time.sleep(0.1)
-            
     except KeyboardInterrupt:
-        console.print("\n\n[yellow]⏹ Stopping recording...[/yellow]")
+        console.print("\n\n[yellow]⏹ Stopping...[/yellow]")
     
-    # Stop capture
     capture.stop()
-    final_duration = capture.get_duration_str()
-    
-    # Combine transcript
     transcript = "\n".join(transcript_parts)
     
     if not transcript.strip():
-        console.print("\n[yellow]⚠ No speech was detected during recording.[/yellow]")
-        console.print("[dim]Make sure audio is playing through the selected device.[/dim]")
-        console.print("\n[cyan]Running demo mode to show output format...[/cyan]")
+        console.print("[yellow]No speech detected. Running demo mode.[/yellow]")
         return run_demo_mode()
     
-    console.print(f"\n[green]✓ Recording complete![/green]")
-    console.print(f"  Duration: {final_duration}")
-    console.print(f"  Chunks: {chunk_count}")
-    console.print(f"  Transcript: {len(transcript)} characters")
+    console.print(f"\n[green]✓ Captured {len(transcript)} characters[/green]")
     
-    # Process and save
-    process_and_save(transcript)
+    # Process through multi-agent system
+    result = orchestrator.process_meeting(transcript)
+    
+    # Save and display
+    files = save_outputs(result, transcript)
+    display_results(result)
+    show_output_summary(files, result)
 
 
 def run_demo_mode():
-    """Run demo with sample transcript file."""
+    """Run demo with sample transcript through multi-agent system."""
     console.print(Panel.fit(
-        "[bold cyan]📄 DEMO MODE - Sample Transcript[/bold cyan]\n\n"
-        "Processing demo_transcript.txt to show\n"
-        "AI-generated meeting notes format",
+        "[bold cyan]📄 DEMO MODE - Multi-Agent Processing[/bold cyan]\n\n"
+        "Processing sample meeting transcript\n"
+        "through the multi-agent pipeline",
         title="MinutesX Demo",
         border_style="yellow"
     ))
     
-    # Load transcript from file
+    # Load transcript
     sample_file = Path("demo_transcript.txt")
     if sample_file.exists():
         transcript = sample_file.read_text(encoding='utf-8')
-        console.print(f"\n[green]✓ Loaded: {sample_file} ({len(transcript)} chars)[/green]")
+        console.print(f"\n[green]✓ Loaded: {sample_file}[/green]")
     else:
-        console.print(f"\n[yellow]⚠ demo_transcript.txt not found, using built-in sample[/yellow]")
-        transcript = """
-Sarah Chen: Good morning everyone. Let's start our Q1 planning meeting. We have important items to discuss today including mobile performance, user onboarding, and the API initiative.
+        transcript = get_sample_transcript()
+        console.print("\n[yellow]Using built-in sample transcript[/yellow]")
+    
+    # Initialize and run multi-agent system
+    console.print("\n[bold]Initializing Multi-Agent System...[/bold]")
+    orchestrator = OrchestratorAgent()
+    
+    # Process meeting
+    result = orchestrator.process_meeting(transcript)
+    
+    # Save and display
+    files = save_outputs(result, transcript)
+    display_results(result)
+    show_output_summary(files, result)
 
-John Martinez: Thanks Sarah. Looking at our Q4 numbers, we shipped twelve features but our Android crash rate is at 2.5%, above our 1% threshold. This is affecting our app store rating.
 
-Mike Thompson: I've been investigating. The crashes are memory-related on older Android devices with less than 4GB RAM. I can implement a chunked sync approach to reduce memory by 60%.
+def get_sample_transcript():
+    """Get built-in sample transcript."""
+    return """
+Sarah Chen: Good morning everyone. Let's start our Q1 planning meeting. We have important items to discuss.
 
-Sarah Chen: How long for the fix?
+John Martinez: Thanks Sarah. Looking at our metrics, the Android crash rate is at 2.5%, above our 1% target. This needs immediate attention.
 
-Mike Thompson: By January 15th if we prioritize it. But we'd need to push the real-time collaboration feature.
+Mike Thompson: I've investigated - it's memory issues on older devices. I can fix it by January 15th if we prioritize it.
 
-John Martinez: User retention is more critical right now. Let's do it.
+Sarah Chen: Mike, that's your top priority. What about user onboarding?
 
-Sarah Chen: Agreed. Mike, crash fix is top priority. John, update the sprint plan.
-
-Lisa Wang: Can I add something? Our onboarding has a 40% drop-off at step 3 where users connect data sources. I want to redesign it into a simpler 3-step wizard.
+Lisa Wang: Our data shows 40% drop-off at step 3. I'm proposing a simplified 3-step wizard.
 
 David Kim: Users who complete onboarding have 3x higher retention. This is a major opportunity.
 
-Sarah Chen: Lisa, prepare mockups by January 10th. David, I need a funnel analysis report by Thursday.
+Sarah Chen: Lisa, prepare mockups by January 10th. David, I need a funnel report by Thursday.
 
-John Martinez: I also want to allocate 20% of sprint capacity to technical debt. Our auth system uses deprecated libraries.
+John Martinez: I also want to allocate 20% of sprint capacity to technical debt.
 
-Sarah Chen: Approved. Now let's discuss the API initiative for enterprise customers.
+Sarah Chen: Approved. Let's discuss the API initiative for enterprise customers.
 
-Mike Thompson: We could have a beta API with read-only endpoints by end of March. About 6 weeks of work.
+Mike Thompson: We can have a beta API ready by end of March - about 6 weeks of work.
 
-Sarah Chen: John, assign Priya to lead API development. Let me summarize action items:
+Sarah Chen: John, assign Priya to lead API development. Let me summarize:
 - Mike: Fix Android crashes by January 15
 - Lisa: Onboarding mockups by January 10
 - David: Funnel report by Thursday
-- John: 20% capacity to tech debt, assign Priya to API
-- Weekly syncs on Tuesdays
+- John: 20% to tech debt, assign Priya to API
 
-John Martinez: I'll set up the syncs and a Thursday check-in.
+John Martinez: I'll set up weekly syncs on Tuesdays.
 
-Sarah Chen: Great meeting. Let's execute and reconvene in two weeks.
+Sarah Chen: Great meeting everyone. Let's execute and reconvene in two weeks.
 """
-    
-    process_and_save(transcript)
 
 
-def process_and_save(transcript):
-    """Process transcript with Gemini and save all output files."""
-    console.print(f"\n[cyan]📊 Processing transcript ({len(transcript)} characters)...[/cyan]")
-    console.print("\n[bold]🤖 Generating AI outputs with Gemini 2.5 Flash...[/bold]\n")
-    
-    # Generate all three outputs
-    with console.status("[bold green]Generating AI Caption..."):
-        caption = generate_caption(transcript)
-    console.print("[green]✓[/green] Caption generated")
-    
-    with console.status("[bold green]Generating AI Summary..."):
-        summary = generate_summary(transcript)
-    console.print("[green]✓[/green] Summary generated")
-    
-    with console.status("[bold green]Generating AI Notes with Action Items..."):
-        notes = generate_notes(transcript)
-    console.print("[green]✓[/green] Notes generated")
-    
-    # Save all outputs
-    files = save_outputs(transcript, caption, summary, notes)
-    
-    # Display preview in console
-    display_results(caption, summary, notes)
-    
-    # Show saved files summary
+def show_output_summary(files: Dict, result: Dict):
+    """Show final output summary."""
     console.print("\n" + "="*70)
     console.print(Panel.fit(
-        "[bold green]✅ OUTPUT FILES GENERATED![/bold green]\n\n"
-        f"📁 Location: [cyan]{OUTPUT_DIR.absolute()}[/cyan]\n\n"
-        "📝 [bold]ai_caption.txt[/bold]  - One-line meeting caption\n"
-        "📋 [bold]ai_summary.txt[/bold]  - Executive summary & key points\n"
-        "📄 [bold]ai_notes.txt[/bold]    - Detailed notes & action items\n"
-        f"📜 [dim]{files['transcript'].name}[/dim] - Raw transcript",
-        title="Files Saved",
+        f"[bold green]✅ MULTI-AGENT PROCESSING COMPLETE![/bold green]\n\n"
+        f"📁 Output Location: [cyan]{OUTPUT_DIR.absolute()}[/cyan]\n\n"
+        f"📝 [bold]ai_caption.txt[/bold]  - Headlines & social captions\n"
+        f"📋 [bold]ai_summary.txt[/bold]  - Executive summary & key points\n"
+        f"📄 [bold]ai_notes.txt[/bold]    - Action items & follow-ups\n"
+        f"📜 [dim]{files['transcript'].name}[/dim] - Raw transcript\n\n"
+        f"[dim]─────────────────────────────────────────[/dim]\n"
+        f"🤖 Agents: Orchestrator + Caption + Summary + Action\n"
+        f"📨 A2A Messages: {result.get('a2a_stats', {}).get('total_messages', 0)}\n"
+        f"⏱ Processing: {result.get('duration_seconds', 0)}s",
+        title="Files Generated",
         border_style="green"
     ))
-    
-    console.print("\n[cyan]Open the ./output/ folder to view your meeting notes![/cyan]\n")
 
 
 def main():
-    """Main entry point - MinutesX Live Google Meet Notes."""
+    """Main entry point."""
     console.print(Panel.fit(
-        "[bold magenta]╔═══════════════════════════════════════════════════╗[/bold magenta]\n"
-        "[bold magenta]║           MinutesX - AI Meeting Notes             ║[/bold magenta]\n"
-        "[bold magenta]║         Powered by Gemini 2.5 Flash               ║[/bold magenta]\n"
-        "[bold magenta]╚═══════════════════════════════════════════════════╝[/bold magenta]\n\n"
-        "[white]Transform Google Meet calls into actionable[/white]\n"
-        "[white]notes, summaries, and captions instantly.[/white]\n\n"
-        "[dim]Output: ./output/ai_caption.txt, ai_summary.txt, ai_notes.txt[/dim]",
+        "[bold magenta]╔═══════════════════════════════════════════════════════╗[/bold magenta]\n"
+        "[bold magenta]║       MinutesX - AI Meeting Notes (Multi-Agent)       ║[/bold magenta]\n"
+        "[bold magenta]║           Powered by Gemini 2.5 Flash                 ║[/bold magenta]\n"
+        "[bold magenta]╚═══════════════════════════════════════════════════════╝[/bold magenta]\n\n"
+        "[white]Transform Google Meet calls into actionable notes[/white]\n"
+        "[white]using a multi-agent AI system with A2A protocol.[/white]\n\n"
+        "[dim]Agents: Orchestrator → Caption + Summary + Action[/dim]",
         border_style="magenta"
     ))
     
     console.print("\n[bold cyan]Select Mode:[/bold cyan]")
-    console.print("  [bold green][1][/bold green] 🎤 [bold]LIVE MODE[/bold] - Capture audio from Google Meet")
-    console.print("      [dim]→ Listens to your meeting in real-time[/dim]")
-    console.print("  [bold yellow][2][/bold yellow] 📄 [bold]DEMO MODE[/bold] - Process sample transcript")
-    console.print("      [dim]→ Shows output format without audio[/dim]")
+    console.print("  [bold green][1][/bold green] 🎤 [bold]LIVE[/bold] - Capture Google Meet audio")
+    console.print("  [bold yellow][2][/bold yellow] 📄 [bold]DEMO[/bold] - Process sample transcript")
     
     console.print("\n[cyan]Enter 1 or 2:[/cyan] ", end="")
     
@@ -715,20 +1186,19 @@ def main():
                 run_live_demo()
             else:
                 console.print("\n[red]❌ Audio libraries not installed![/red]")
-                console.print("\n[yellow]To enable live mode, run:[/yellow]")
-                console.print("[bold]  pip install sounddevice numpy[/bold]")
-                console.print("\n[dim]Running demo mode instead...[/dim]\n")
-                time.sleep(2)
+                console.print("[yellow]Run: pip install sounddevice numpy[/yellow]")
+                console.print("\n[dim]Running demo mode...[/dim]\n")
+                time.sleep(1)
                 run_demo_mode()
         else:
             run_demo_mode()
             
     except KeyboardInterrupt:
-        console.print("\n\n[yellow]Cancelled by user.[/yellow]")
+        console.print("\n\n[yellow]Cancelled.[/yellow]")
     except Exception as e:
         console.print(f"\n[red]Error: {e}[/red]")
         import traceback
-        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

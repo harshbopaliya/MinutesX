@@ -1,19 +1,20 @@
 """
-MinutesX Demo - Google Meet Live Transcription & Notes
-=======================================================
+MinutesX - Live Google Meet Transcription & AI Notes
+=====================================================
 
-This demo captures system audio (from Google Meet), transcribes it using
-Gemini 2.5 Flash, and generates meeting notes with captions, summaries,
-and action items.
+Captures LIVE audio from Google Meet calls and generates:
+- ai_caption.txt  - One-line meeting caption
+- ai_summary.txt  - Executive summary with key points  
+- ai_notes.txt    - Detailed meeting notes with action items
 
-Usage:
-    1. Set your GOOGLE_API_KEY in .env file
-    2. Start a Google Meet call
-    3. Run: python demo.py
-    4. Press Ctrl+C to stop and get meeting summary
+HOW TO USE:
+1. Start your Google Meet call
+2. Run: python demo.py
+3. Select your audio device (use Stereo Mix/WASAPI loopback)
+4. Press Ctrl+C when meeting ends
+5. Find your notes in ./output/ folder
 
-Requirements:
-    pip install google-generativeai sounddevice numpy python-dotenv rich
+Run: python demo.py
 """
 
 import os
@@ -21,558 +22,714 @@ import sys
 import time
 import json
 import queue
-import threading
 import base64
 import io
 import wave
+import threading
 from datetime import datetime
 from pathlib import Path
 
-# Load environment variables
+# Load environment
 from dotenv import load_dotenv
 load_dotenv()
 
-# Rich for beautiful console output
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 from rich.text import Text
+from rich.layout import Layout
 
 console = Console()
 
-# Check for API key
+# =============================================================================
+# Configuration
+# =============================================================================
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OUTPUT_DIR = Path("./output")
+
 if not GOOGLE_API_KEY:
-    console.print("[red]ERROR: GOOGLE_API_KEY not found![/red]")
-    console.print("[yellow]Please set it in your .env file:[/yellow]")
+    console.print("[red]❌ ERROR: GOOGLE_API_KEY not set![/red]")
+    console.print("\n[yellow]Add to your .env file:[/yellow]")
     console.print("GOOGLE_API_KEY=your_api_key_here")
-    console.print("\nGet your key at: https://aistudio.google.com/apikey")
+    console.print("\n[cyan]Get your free key at: https://aistudio.google.com/apikey[/cyan]")
     sys.exit(1)
 
-# Import Google Generative AI
+# Initialize Gemini
 import google.generativeai as genai
 genai.configure(api_key=GOOGLE_API_KEY)
 
+# Model name - Gemini 2.0 Flash
+MODEL_NAME = "gemini-2.0-flash-exp"
+
 # Try to import audio libraries
+AUDIO_OK = False
 try:
     import sounddevice as sd
     import numpy as np
-    AUDIO_AVAILABLE = True
+    AUDIO_OK = True
 except ImportError:
-    AUDIO_AVAILABLE = False
-    console.print("[yellow]Warning: sounddevice/numpy not installed.[/yellow]")
-    console.print("[yellow]Run: pip install sounddevice numpy[/yellow]")
+    console.print("[yellow]⚠ Audio libraries not installed.[/yellow]")
+    console.print("[dim]Run: pip install sounddevice numpy[/dim]\n")
 
 
-class MeetingRecorder:
-    """Records system audio for Google Meet capture."""
+# =============================================================================
+# Audio Capture Class - Enhanced for Google Meet
+# =============================================================================
+
+class AudioCapture:
+    """Captures system audio from Google Meet using loopback/WASAPI."""
     
-    def __init__(self, sample_rate=16000, channels=1, chunk_seconds=10):
+    def __init__(self, sample_rate=16000, chunk_seconds=8):
         self.sample_rate = sample_rate
-        self.channels = channels
-        self.chunk_seconds = chunk_seconds
-        self.audio_queue = queue.Queue()
-        self.is_recording = False
-        self.recorded_audio = []
-        
+        self.chunk_seconds = chunk_seconds  # Shorter chunks for faster response
+        self.queue = queue.Queue()
+        self.recording = False
+        self.all_audio = []
+        self.total_duration = 0
+    
     def list_devices(self):
-        """List available audio devices."""
-        if not AUDIO_AVAILABLE:
-            return []
-        
+        """List all audio input devices with loopback detection."""
         devices = []
-        for i, dev in enumerate(sd.query_devices()):
-            if dev['max_input_channels'] > 0:
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] > 0:
+                name_lower = d['name'].lower()
+                # Detect loopback devices (captures system audio)
+                is_loopback = any(x in name_lower for x in [
+                    'loopback', 'stereo mix', 'wasapi', 'what u hear',
+                    'wave out', 'mix', 'system audio', 'virtual'
+                ])
                 devices.append({
-                    'index': i,
-                    'name': dev['name'],
-                    'channels': dev['max_input_channels'],
-                    'is_loopback': 'loopback' in dev['name'].lower() or 'stereo mix' in dev['name'].lower()
+                    'idx': i, 
+                    'name': d['name'], 
+                    'loopback': is_loopback,
+                    'channels': d['max_input_channels'],
+                    'rate': d['default_samplerate']
                 })
         return devices
     
-    def find_best_device(self):
-        """Find the best device for capturing system audio."""
+    def find_loopback(self):
+        """Find the best loopback device for capturing system audio."""
         devices = self.list_devices()
         
-        # Priority: Loopback > Stereo Mix > Default
-        for dev in devices:
-            if 'loopback' in dev['name'].lower():
-                return dev['index']
+        # Priority order for loopback devices
+        priority_keywords = ['loopback', 'stereo mix', 'wasapi', 'what u hear']
         
-        for dev in devices:
-            if 'stereo mix' in dev['name'].lower():
-                return dev['index']
+        for keyword in priority_keywords:
+            for d in devices:
+                if keyword in d['name'].lower():
+                    return d['idx']
         
-        # Return default input device
+        # If no loopback found, return None (will use mic)
         return None
     
-    def start(self, device_index=None):
-        """Start recording audio."""
-        if not AUDIO_AVAILABLE:
-            console.print("[red]Audio capture not available.[/red]")
-            return False
+    def start(self, device=None):
+        """Start audio capture from selected device."""
+        self.recording = True
+        self.all_audio = []
+        self.total_duration = 0
         
-        self.is_recording = True
-        self.recorded_audio = []
-        
-        def audio_callback(indata, frames, time_info, status):
-            if status:
-                console.print(f"[yellow]Audio status: {status}[/yellow]")
-            if self.is_recording:
-                self.audio_queue.put(indata.copy())
+        def callback(indata, frames, time_info, status):
+            if self.recording:
+                self.queue.put(indata.copy())
         
         try:
+            # Use specified device or default
             self.stream = sd.InputStream(
-                device=device_index,
-                channels=self.channels,
+                device=device,
+                channels=1,
                 samplerate=self.sample_rate,
                 dtype='int16',
-                callback=audio_callback,
+                callback=callback,
                 blocksize=int(self.sample_rate * 0.5)  # 500ms blocks
             )
             self.stream.start()
-            console.print("[green]✓ Audio recording started[/green]")
             return True
         except Exception as e:
-            console.print(f"[red]Failed to start audio: {e}[/red]")
-            self.is_recording = False
+            console.print(f"[red]Audio error: {e}[/red]")
             return False
     
-    def get_chunk(self, timeout=None):
-        """Get a chunk of recorded audio."""
-        if not self.is_recording:
-            return None
-        
+    def get_chunk(self):
+        """Get audio chunk for transcription."""
         chunks = []
         samples_needed = int(self.sample_rate * self.chunk_seconds)
-        samples_collected = 0
+        collected = 0
         
-        start_time = time.time()
-        timeout = timeout or (self.chunk_seconds + 2)
-        
-        while samples_collected < samples_needed:
-            if time.time() - start_time > timeout:
+        timeout_start = time.time()
+        while collected < samples_needed and self.recording:
+            if time.time() - timeout_start > self.chunk_seconds + 2:
                 break
             try:
-                chunk = self.audio_queue.get(timeout=0.5)
+                chunk = self.queue.get(timeout=0.5)
                 chunks.append(chunk)
-                samples_collected += len(chunk)
+                collected += len(chunk)
             except queue.Empty:
                 continue
         
         if chunks:
-            audio_data = np.concatenate(chunks)
-            self.recorded_audio.append(audio_data)
-            return audio_data
+            audio = np.concatenate(chunks)
+            self.all_audio.append(audio)
+            self.total_duration += len(audio) / self.sample_rate
+            return audio
         return None
     
     def stop(self):
-        """Stop recording."""
-        self.is_recording = False
+        """Stop audio capture."""
+        self.recording = False
         if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
-        console.print("[yellow]Audio recording stopped[/yellow]")
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except:
+                pass
     
-    def get_all_audio(self):
-        """Get all recorded audio as one array."""
-        if self.recorded_audio:
-            return np.concatenate(self.recorded_audio)
+    def get_duration_str(self):
+        """Get formatted duration string."""
+        mins = int(self.total_duration // 60)
+        secs = int(self.total_duration % 60)
+        return f"{mins:02d}:{secs:02d}"
+    
+    def to_wav(self, audio):
+        """Convert numpy audio to WAV bytes for Gemini."""
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.sample_rate)
+            w.writeframes(audio.tobytes())
+        return buf.getvalue()
+
+
+# =============================================================================
+# Gemini AI Functions - Optimized for Live Transcription
+# =============================================================================
+
+def transcribe_audio(wav_bytes):
+    """Transcribe audio chunk using Gemini 2.5 Flash."""
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+        
+        response = model.generate_content([
+            """Transcribe this audio accurately. 
+            - Return ONLY the spoken words
+            - Include speaker names if identifiable (e.g., "John: Hello everyone")
+            - If no speech detected, return [silence]
+            - Keep filler words minimal""",
+            {"mime_type": "audio/wav", "data": audio_b64}
+        ])
+        
+        text = response.text.strip()
+        if text and text != "[silence]" and len(text) > 3:
+            return text
         return None
-    
-    def audio_to_wav_bytes(self, audio_data):
-        """Convert audio numpy array to WAV bytes."""
-        buffer = io.BytesIO()
-        with wave.open(buffer, 'wb') as wav:
-            wav.setnchannels(self.channels)
-            wav.setsampwidth(2)  # 16-bit
-            wav.setframerate(self.sample_rate)
-            wav.writeframes(audio_data.tobytes())
-        return buffer.getvalue()
+    except Exception as e:
+        # Silent fail for transcription to not interrupt flow
+        return None
 
 
-class GeminiTranscriber:
-    """Transcribes audio using Gemini 2.5 Flash."""
+def generate_caption(transcript):
+    """Generate a concise meeting caption."""
+    model = genai.GenerativeModel(MODEL_NAME)
     
-    def __init__(self):
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        self.transcript_parts = []
-        
-    def transcribe_audio(self, wav_bytes):
-        """Transcribe audio using Gemini's multimodal capabilities."""
-        try:
-            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-            
-            response = self.model.generate_content([
-                "Transcribe this audio accurately. Return ONLY the spoken text, nothing else. If there's no speech, return [silence].",
-                {"mime_type": "audio/wav", "data": audio_b64}
-            ])
-            
-            text = response.text.strip()
-            if text and text != "[silence]":
-                self.transcript_parts.append(text)
-                return text
-            return None
-            
-        except Exception as e:
-            console.print(f"[red]Transcription error: {e}[/red]")
-            return None
+    prompt = f"""Create a professional one-line caption (max 100 characters) for this meeting.
+Focus on the main topic, decision, or outcome.
+
+Meeting transcript:
+{transcript[:8000]}
+
+Return ONLY the caption text, nothing else."""
     
-    def get_full_transcript(self):
-        """Get the complete transcript."""
-        return "\n".join(self.transcript_parts)
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return f"Meeting - {datetime.now().strftime('%B %d, %Y')}"
 
 
-class MeetingAnalyzer:
-    """Analyzes meeting transcript using Gemini 2.5 Flash."""
+def generate_summary(transcript):
+    """Generate comprehensive meeting summary."""
+    model = genai.GenerativeModel(MODEL_NAME)
     
-    def __init__(self):
-        self.model = genai.GenerativeModel(
-            'gemini-2.0-flash-exp',
-            generation_config={"temperature": 0.3, "max_output_tokens": 4096}
-        )
-    
-    def generate_caption(self, transcript):
-        """Generate a one-line caption for the meeting."""
-        prompt = f"""Create a one-line caption (max 100 characters) summarizing this meeting:
+    prompt = f"""Analyze this meeting transcript and create a comprehensive summary.
 
-{transcript[:5000]}
+MEETING TRANSCRIPT:
+{transcript[:15000]}
 
-Return ONLY the caption text."""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            return f"Meeting on {datetime.now().strftime('%B %d, %Y')}"
+Create a detailed summary with these exact sections:
+
+## EXECUTIVE SUMMARY
+Write 3-4 sentences capturing the essence of the meeting - what was discussed, key outcomes, and overall tone.
+
+## KEY DISCUSSION POINTS
+List 5-7 main points discussed with brief context for each:
+• Point 1 - brief explanation
+• Point 2 - brief explanation
+(continue as needed)
+
+## DECISIONS MADE
+List all decisions that were agreed upon during the meeting:
+• Decision 1
+• Decision 2
+(if no decisions, state "No formal decisions were made")
+
+## TOPICS COVERED
+• Topic 1
+• Topic 2
+• Topic 3
+
+## PARTICIPANTS
+List identified speakers and their apparent roles (if determinable)
+
+## MEETING OUTCOME
+Brief paragraph on what was achieved and the overall result of the meeting.
+
+Format with clear headers and bullet points. Be specific and actionable."""
     
-    def generate_summary(self, transcript):
-        """Generate meeting summary with key points."""
-        prompt = f"""Analyze this meeting transcript and provide a summary.
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Summary generation failed: {str(e)}"
+
+
+def generate_notes(transcript):
+    """Generate detailed meeting notes with action items."""
+    model = genai.GenerativeModel(MODEL_NAME)
+    
+    prompt = f"""Create comprehensive, professional meeting notes from this transcript.
 
 TRANSCRIPT:
 {transcript[:15000]}
 
-Return a JSON object with this structure:
-{{
-    "executive_summary": "3-sentence executive summary",
-    "key_points": ["point 1", "point 2", "point 3", "..."],
-    "decisions": ["decision 1", "decision 2"],
-    "topics_discussed": ["topic 1", "topic 2"]
-}}
+Generate detailed meeting notes in this EXACT format:
 
-Return ONLY valid JSON."""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except Exception as e:
-            console.print(f"[yellow]Summary parsing issue: {e}[/yellow]")
-            return {
-                "executive_summary": "Meeting summary could not be generated.",
-                "key_points": [],
-                "decisions": [],
-                "topics_discussed": []
-            }
+## MEETING INFORMATION
+- Date: {datetime.now().strftime('%B %d, %Y')}
+- Time: {datetime.now().strftime('%I:%M %p')}
+- Generated by: MinutesX AI (Gemini 2.5 Flash)
+
+## MEETING OVERVIEW
+Write a 2-3 paragraph summary covering what the meeting was about, who participated, and the main outcomes.
+
+## ACTION ITEMS
+Extract ALL tasks, to-dos, and commitments mentioned. Format each as:
+
+☐ [Specific Task Description]
+   → Assigned to: [Name or "Unassigned"]
+   → Priority: [High/Medium/Low based on context]
+   → Due: [Date if mentioned, otherwise "TBD"]
+
+☐ [Next task...]
+
+(Include at least 3-5 action items. If none explicitly stated, infer from commitments made)
+
+## KEY DECISIONS
+Document all decisions made during the meeting:
+✓ Decision 1 - context/reasoning
+✓ Decision 2 - context/reasoning
+
+## DISCUSSION HIGHLIGHTS
+Important points raised during discussion:
+• Point 1 - details
+• Point 2 - details
+• Point 3 - details
+
+## FOLLOW-UP REQUIRED
+Items needing follow-up after this meeting:
+• Follow-up item 1
+• Follow-up item 2
+
+## NEXT STEPS
+What should happen after this meeting:
+1. First step
+2. Second step
+3. Third step
+
+## PARKING LOT
+Issues raised but not resolved (for future discussion):
+• Item 1
+• Item 2
+(or "None" if all items were addressed)
+
+## NOTES
+Any additional observations or context that might be useful.
+
+Make notes comprehensive, professional, and immediately actionable."""
     
-    def extract_action_items(self, transcript):
-        """Extract action items from transcript."""
-        prompt = f"""Extract action items from this meeting transcript.
-
-TRANSCRIPT:
-{transcript[:15000]}
-
-Return a JSON array:
-[
-    {{"task": "description", "owner": "person name or Unassigned", "priority": "high/medium/low"}}
-]
-
-Return ONLY valid JSON array."""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
-        except Exception as e:
-            console.print(f"[yellow]Action items parsing issue: {e}[/yellow]")
-            return []
-    
-    def generate_live_caption(self, text):
-        """Generate a clean caption from raw transcript text."""
-        prompt = f"""Clean up this transcript segment for display as a live caption.
-Remove filler words, fix grammar, keep it concise (max 80 chars).
-
-Text: {text}
-
-Return ONLY the cleaned caption."""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()[:100]
-        except:
-            return text[:100]
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Notes generation failed: {str(e)}"
 
 
-def save_meeting_notes(transcript, caption, summary, action_items, output_dir="./meeting_notes"):
-    """Save meeting notes to files."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
+# =============================================================================
+# Output Functions
+# =============================================================================
+
+def save_outputs(transcript, caption, summary, notes):
+    """Save all outputs to ./output folder."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Save transcript
-    transcript_file = output_path / f"meeting_{timestamp}_transcript.txt"
-    transcript_file.write_text(transcript, encoding='utf-8')
-    
-    # Save markdown notes
-    md_content = f"""# Meeting Notes
-**Date:** {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+    # 1. Save AI Caption
+    caption_file = OUTPUT_DIR / "ai_caption.txt"
+    caption_content = f"""╔══════════════════════════════════════════════════════════════════╗
+║                    MinutesX - AI CAPTION                          ║
+╚══════════════════════════════════════════════════════════════════╝
 
-## Caption
+Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+Model: Gemini 2.5 Flash
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MEETING CAPTION:
 {caption}
 
-## Executive Summary
-{summary.get('executive_summary', 'N/A')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## Key Points
+Use this caption for:
+• Slack/Teams updates
+• Email subject lines
+• Calendar event titles
+• Meeting summaries
 """
-    for point in summary.get('key_points', []):
-        md_content += f"- {point}\n"
+    caption_file.write_text(caption_content, encoding='utf-8')
     
-    md_content += "\n## Decisions Made\n"
-    for decision in summary.get('decisions', []):
-        md_content += f"- {decision}\n"
+    # 2. Save AI Summary
+    summary_file = OUTPUT_DIR / "ai_summary.txt"
+    summary_content = f"""╔══════════════════════════════════════════════════════════════════╗
+║                    MinutesX - AI SUMMARY                          ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+Model: Gemini 2.5 Flash
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{summary}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Powered by MinutesX | github.com/harshbopaliya/MinutesX
+"""
+    summary_file.write_text(summary_content, encoding='utf-8')
     
-    md_content += "\n## Action Items\n"
-    for item in action_items:
-        priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.get('priority', 'medium'), "⚪")
-        md_content += f"- {priority_emoji} **{item.get('task', '')}** - {item.get('owner', 'Unassigned')}\n"
+    # 3. Save AI Notes
+    notes_file = OUTPUT_DIR / "ai_notes.txt"
+    notes_content = f"""╔══════════════════════════════════════════════════════════════════╗
+║                    MinutesX - AI MEETING NOTES                    ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+Model: Gemini 2.5 Flash
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{notes}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Powered by MinutesX | github.com/harshbopaliya/MinutesX
+"""
+    notes_file.write_text(notes_content, encoding='utf-8')
     
-    md_content += "\n## Topics Discussed\n"
-    md_content += ", ".join(summary.get('topics_discussed', ['General discussion']))
+    # 4. Save raw transcript
+    transcript_file = OUTPUT_DIR / f"transcript_{timestamp}.txt"
+    transcript_file.write_text(f"Meeting Transcript - {datetime.now().strftime('%B %d, %Y')}\n\n{transcript}", encoding='utf-8')
     
-    notes_file = output_path / f"meeting_{timestamp}_notes.md"
-    notes_file.write_text(md_content, encoding='utf-8')
-    
-    # Save JSON
-    json_data = {
-        "timestamp": timestamp,
-        "caption": caption,
-        "summary": summary,
-        "action_items": action_items,
-        "transcript": transcript
+    return {
+        'caption': caption_file,
+        'summary': summary_file,
+        'notes': notes_file,
+        'transcript': transcript_file
     }
-    json_file = output_path / f"meeting_{timestamp}_data.json"
-    json_file.write_text(json.dumps(json_data, indent=2), encoding='utf-8')
+
+
+def display_results(caption, summary, notes):
+    """Display results in console."""
+    console.print("\n" + "="*70)
+    console.print(Panel(f"[bold cyan]{caption}[/bold cyan]", title="📝 AI CAPTION", border_style="cyan"))
     
-    return transcript_file, notes_file, json_file
-
-
-def display_results(caption, summary, action_items):
-    """Display meeting results in console."""
     console.print("\n")
-    console.print(Panel(f"[bold]{caption}[/bold]", title="📝 Meeting Caption", border_style="cyan"))
+    console.print(Panel(summary[:1500] + "..." if len(summary) > 1500 else summary, 
+                       title="📋 AI SUMMARY (Preview)", border_style="green"))
     
-    if summary.get('executive_summary'):
-        console.print(Panel(summary['executive_summary'], title="📋 Executive Summary", border_style="green"))
-    
-    if summary.get('key_points'):
-        console.print("\n[bold]📌 Key Points:[/bold]")
-        for point in summary['key_points'][:7]:
-            console.print(f"  • {point}")
-    
-    if summary.get('decisions'):
-        console.print("\n[bold]🎯 Decisions Made:[/bold]")
-        for decision in summary['decisions'][:5]:
-            console.print(f"  • {decision}")
-    
-    if action_items:
-        table = Table(title="✅ Action Items", show_header=True, header_style="bold magenta")
-        table.add_column("Priority", width=8)
-        table.add_column("Task", width=50)
-        table.add_column("Owner", width=15)
-        
-        for item in action_items[:10]:
-            priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.get('priority', 'medium'), "⚪")
-            table.add_row(priority_emoji, item.get('task', '')[:50], item.get('owner', 'Unassigned'))
-        
-        console.print(table)
+    console.print("\n")
+    console.print(Panel(notes[:1500] + "..." if len(notes) > 1500 else notes,
+                       title="📄 AI NOTES (Preview)", border_style="yellow"))
 
 
-def run_demo():
-    """Run the MinutesX demo."""
+# =============================================================================
+# Main Demo Functions - Live Google Meet Capture
+# =============================================================================
+
+def run_live_demo():
+    """Run LIVE Google Meet audio capture and transcription."""
     console.print(Panel.fit(
-        "[bold cyan]MinutesX - Google Meet Live Transcription Demo[/bold cyan]\n\n"
-        "This demo will:\n"
-        "1. Capture audio from your system (Google Meet)\n"
-        "2. Transcribe speech in real-time using Gemini 2.5 Flash\n"
-        "3. Generate meeting notes, captions, and action items\n\n"
+        "[bold cyan]🎤 LIVE MODE - Google Meet Capture[/bold cyan]\n\n"
+        "• Captures system audio from Google Meet in real-time\n"
+        "• Transcribes with Gemini 2.5 Flash\n"
+        "• Generates ai_caption.txt, ai_summary.txt, ai_notes.txt\n\n"
         "[yellow]Press Ctrl+C to stop recording and generate notes[/yellow]",
-        title="🎯 MinutesX Demo"
+        title="MinutesX Live",
+        border_style="cyan"
     ))
     
-    if not AUDIO_AVAILABLE:
-        console.print("\n[red]Audio capture not available. Running in transcript-only mode.[/red]")
-        console.print("[yellow]To enable audio capture: pip install sounddevice numpy[/yellow]\n")
-        run_transcript_demo()
-        return
+    capture = AudioCapture(chunk_seconds=8)  # 8 second chunks
     
-    # Initialize components
-    recorder = MeetingRecorder(chunk_seconds=10)
-    transcriber = GeminiTranscriber()
-    analyzer = MeetingAnalyzer()
+    # Show available audio devices
+    console.print("\n[bold cyan]📢 Audio Input Devices:[/bold cyan]")
+    console.print("[dim]Select a LOOPBACK device to capture Google Meet audio[/dim]\n")
     
-    # List and select audio device
-    console.print("\n[cyan]Available Audio Devices:[/cyan]")
-    devices = recorder.list_devices()
+    devices = capture.list_devices()
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("#", width=4)
+    table.add_column("Device Name", width=50)
+    table.add_column("Type", width=15)
     
-    for dev in devices:
-        loopback = " [green](LOOPBACK)[/green]" if dev['is_loopback'] else ""
-        console.print(f"  [{dev['index']}] {dev['name']}{loopback}")
+    for d in devices:
+        device_type = "[green]◀ LOOPBACK[/green]" if d['loopback'] else "[dim]Microphone[/dim]"
+        table.add_row(str(d['idx']), d['name'], device_type)
     
-    best_device = recorder.find_best_device()
-    if best_device is not None:
-        console.print(f"\n[green]Auto-selected device: {best_device}[/green]")
+    console.print(table)
+    
+    # Find loopback device
+    loopback = capture.find_loopback()
+    if loopback is not None:
+        console.print(f"\n[green]✓ Auto-detected loopback device: [{loopback}][/green]")
     else:
-        console.print("\n[yellow]No loopback device found. Using default microphone.[/yellow]")
-        console.print("[dim]Tip: Enable 'Stereo Mix' in Windows Sound settings to capture system audio[/dim]")
+        console.print("\n[yellow]⚠ No loopback device detected![/yellow]")
+        console.print("[dim]To capture Google Meet audio, enable 'Stereo Mix' in Windows Sound settings[/dim]")
+        console.print("[dim]Or use microphone input (place near speakers)[/dim]")
     
-    # Ask user to confirm or select device
-    console.print("\n[cyan]Press Enter to start with selected device, or type device number:[/cyan]")
+    # Let user select device
+    console.print("\n[cyan]Enter device number (or press Enter for auto):[/cyan] ", end="")
     try:
-        user_input = input().strip()
-        if user_input:
-            best_device = int(user_input)
-    except (ValueError, EOFError):
-        pass
+        inp = input().strip()
+        device = int(inp) if inp else loopback
+    except:
+        device = loopback
+    
+    selected_name = "Default" 
+    for d in devices:
+        if d['idx'] == device:
+            selected_name = d['name']
+            break
+    
+    console.print(f"\n[cyan]Selected device:[/cyan] {selected_name}")
     
     # Start recording
-    console.print("\n[bold green]Starting audio capture...[/bold green]")
-    console.print("[dim]Make sure Google Meet audio is playing[/dim]\n")
+    if not capture.start(device):
+        console.print("[red]❌ Failed to start audio capture.[/red]")
+        console.print("[yellow]Running demo mode instead...[/yellow]")
+        return run_demo_mode()
     
-    if not recorder.start(best_device):
-        console.print("[red]Failed to start recording. Running transcript demo instead.[/red]")
-        run_transcript_demo()
-        return
+    console.print("\n" + "="*60)
+    console.print("[bold red]🔴 RECORDING LIVE[/bold red] - Listening to Google Meet...")
+    console.print("[dim]Speak clearly or play your Google Meet meeting[/dim]")
+    console.print("[yellow]Press Ctrl+C when meeting ends to generate notes[/yellow]")
+    console.print("="*60 + "\n")
     
-    # Main recording loop
+    transcript_parts = []
+    chunk_count = 0
+    
     console.print("[bold]Live Captions:[/bold]\n")
     
     try:
         while True:
             # Get audio chunk
-            audio_chunk = recorder.get_chunk()
+            audio = capture.get_chunk()
             
-            if audio_chunk is not None and len(audio_chunk) > 0:
-                # Convert to WAV
-                wav_bytes = recorder.audio_to_wav_bytes(audio_chunk)
+            if audio is not None and len(audio) > 0:
+                chunk_count += 1
+                wav = capture.to_wav(audio)
                 
-                # Transcribe
-                text = transcriber.transcribe_audio(wav_bytes)
+                # Show recording indicator
+                duration = capture.get_duration_str()
+                console.print(f"[dim]⏱ {duration}[/dim] ", end="")
+                
+                # Transcribe with Gemini
+                text = transcribe_audio(wav)
                 
                 if text:
-                    # Generate clean caption
-                    caption = analyzer.generate_live_caption(text)
-                    console.print(f"[cyan]>>> {caption}[/cyan]")
+                    transcript_parts.append(text)
+                    # Show live caption
+                    display_text = text[:100] + "..." if len(text) > 100 else text
+                    console.print(f"[cyan]{display_text}[/cyan]")
+                else:
+                    console.print(f"[dim](listening...)[/dim]")
             
             time.sleep(0.1)
             
     except KeyboardInterrupt:
-        console.print("\n\n[yellow]Stopping recording...[/yellow]")
+        console.print("\n\n[yellow]⏹ Stopping recording...[/yellow]")
     
-    # Stop recording
-    recorder.stop()
+    # Stop capture
+    capture.stop()
+    final_duration = capture.get_duration_str()
     
-    # Get full transcript
-    transcript = transcriber.get_full_transcript()
+    # Combine transcript
+    transcript = "\n".join(transcript_parts)
     
     if not transcript.strip():
-        console.print("[yellow]No speech was detected. Make sure audio is playing.[/yellow]")
-        return
+        console.print("\n[yellow]⚠ No speech was detected during recording.[/yellow]")
+        console.print("[dim]Make sure audio is playing through the selected device.[/dim]")
+        console.print("\n[cyan]Running demo mode to show output format...[/cyan]")
+        return run_demo_mode()
     
-    console.print(f"\n[green]✓ Captured {len(transcript)} characters of transcript[/green]")
+    console.print(f"\n[green]✓ Recording complete![/green]")
+    console.print(f"  Duration: {final_duration}")
+    console.print(f"  Chunks: {chunk_count}")
+    console.print(f"  Transcript: {len(transcript)} characters")
     
-    # Process with AI
-    console.print("\n[cyan]Analyzing meeting with Gemini 2.5 Flash...[/cyan]")
-    
-    with console.status("[bold green]Generating meeting notes..."):
-        caption = analyzer.generate_caption(transcript)
-        summary = analyzer.generate_summary(transcript)
-        action_items = analyzer.extract_action_items(transcript)
-    
-    # Display results
-    display_results(caption, summary, action_items)
-    
-    # Save notes
-    transcript_file, notes_file, json_file = save_meeting_notes(
-        transcript, caption, summary, action_items
-    )
-    
-    console.print(f"\n[green]✓ Meeting notes saved:[/green]")
-    console.print(f"  • Transcript: {transcript_file}")
-    console.print(f"  • Notes: {notes_file}")
-    console.print(f"  • Data: {json_file}")
+    # Process and save
+    process_and_save(transcript)
 
 
-def run_transcript_demo():
-    """Run demo with a sample transcript (no audio required)."""
-    console.print("\n[cyan]Running with sample transcript...[/cyan]\n")
+def run_demo_mode():
+    """Run demo with sample transcript file."""
+    console.print(Panel.fit(
+        "[bold cyan]📄 DEMO MODE - Sample Transcript[/bold cyan]\n\n"
+        "Processing demo_transcript.txt to show\n"
+        "AI-generated meeting notes format",
+        title="MinutesX Demo",
+        border_style="yellow"
+    ))
     
-    sample_transcript = """
-    John: Good morning everyone, let's get started with our product planning meeting.
+    # Load transcript from file
+    sample_file = Path("demo_transcript.txt")
+    if sample_file.exists():
+        transcript = sample_file.read_text(encoding='utf-8')
+        console.print(f"\n[green]✓ Loaded: {sample_file} ({len(transcript)} chars)[/green]")
+    else:
+        console.print(f"\n[yellow]⚠ demo_transcript.txt not found, using built-in sample[/yellow]")
+        transcript = """
+Sarah Chen: Good morning everyone. Let's start our Q1 planning meeting. We have important items to discuss today including mobile performance, user onboarding, and the API initiative.
+
+John Martinez: Thanks Sarah. Looking at our Q4 numbers, we shipped twelve features but our Android crash rate is at 2.5%, above our 1% threshold. This is affecting our app store rating.
+
+Mike Thompson: I've been investigating. The crashes are memory-related on older Android devices with less than 4GB RAM. I can implement a chunked sync approach to reduce memory by 60%.
+
+Sarah Chen: How long for the fix?
+
+Mike Thompson: By January 15th if we prioritize it. But we'd need to push the real-time collaboration feature.
+
+John Martinez: User retention is more critical right now. Let's do it.
+
+Sarah Chen: Agreed. Mike, crash fix is top priority. John, update the sprint plan.
+
+Lisa Wang: Can I add something? Our onboarding has a 40% drop-off at step 3 where users connect data sources. I want to redesign it into a simpler 3-step wizard.
+
+David Kim: Users who complete onboarding have 3x higher retention. This is a major opportunity.
+
+Sarah Chen: Lisa, prepare mockups by January 10th. David, I need a funnel analysis report by Thursday.
+
+John Martinez: I also want to allocate 20% of sprint capacity to technical debt. Our auth system uses deprecated libraries.
+
+Sarah Chen: Approved. Now let's discuss the API initiative for enterprise customers.
+
+Mike Thompson: We could have a beta API with read-only endpoints by end of March. About 6 weeks of work.
+
+Sarah Chen: John, assign Priya to lead API development. Let me summarize action items:
+- Mike: Fix Android crashes by January 15
+- Lisa: Onboarding mockups by January 10
+- David: Funnel report by Thursday
+- John: 20% capacity to tech debt, assign Priya to API
+- Weekly syncs on Tuesdays
+
+John Martinez: I'll set up the syncs and a Thursday check-in.
+
+Sarah Chen: Great meeting. Let's execute and reconvene in two weeks.
+"""
     
-    Sarah: Thanks John. So we need to discuss the Q1 roadmap and finalize the feature priorities.
+    process_and_save(transcript)
+
+
+def process_and_save(transcript):
+    """Process transcript with Gemini and save all output files."""
+    console.print(f"\n[cyan]📊 Processing transcript ({len(transcript)} characters)...[/cyan]")
+    console.print("\n[bold]🤖 Generating AI outputs with Gemini 2.5 Flash...[/bold]\n")
     
-    John: Right. I think we should focus on the mobile app improvements first. User feedback has been clear about that.
+    # Generate all three outputs
+    with console.status("[bold green]Generating AI Caption..."):
+        caption = generate_caption(transcript)
+    console.print("[green]✓[/green] Caption generated")
     
-    Mike: I agree. The performance issues on Android are critical. We're seeing a 20% drop-off rate.
+    with console.status("[bold green]Generating AI Summary..."):
+        summary = generate_summary(transcript)
+    console.print("[green]✓[/green] Summary generated")
     
-    Sarah: Okay, so mobile performance is priority one. What about the new dashboard feature?
+    with console.status("[bold green]Generating AI Notes with Action Items..."):
+        notes = generate_notes(transcript)
+    console.print("[green]✓[/green] Notes generated")
     
-    John: Let's push that to Q2. We don't have the bandwidth right now.
+    # Save all outputs
+    files = save_outputs(transcript, caption, summary, notes)
     
-    Mike: Makes sense. I can have the Android fixes ready by end of January if we start next week.
+    # Display preview in console
+    display_results(caption, summary, notes)
     
-    Sarah: Perfect. Mike, you'll lead the mobile performance sprint. John, can you handle the user research for the dashboard?
+    # Show saved files summary
+    console.print("\n" + "="*70)
+    console.print(Panel.fit(
+        "[bold green]✅ OUTPUT FILES GENERATED![/bold green]\n\n"
+        f"📁 Location: [cyan]{OUTPUT_DIR.absolute()}[/cyan]\n\n"
+        "📝 [bold]ai_caption.txt[/bold]  - One-line meeting caption\n"
+        "📋 [bold]ai_summary.txt[/bold]  - Executive summary & key points\n"
+        "📄 [bold]ai_notes.txt[/bold]    - Detailed notes & action items\n"
+        f"📜 [dim]{files['transcript'].name}[/dim] - Raw transcript",
+        title="Files Saved",
+        border_style="green"
+    ))
     
-    John: Yes, I'll set up interviews with 10 power users this month.
+    console.print("\n[cyan]Open the ./output/ folder to view your meeting notes![/cyan]\n")
+
+
+def main():
+    """Main entry point - MinutesX Live Google Meet Notes."""
+    console.print(Panel.fit(
+        "[bold magenta]╔═══════════════════════════════════════════════════╗[/bold magenta]\n"
+        "[bold magenta]║           MinutesX - AI Meeting Notes             ║[/bold magenta]\n"
+        "[bold magenta]║         Powered by Gemini 2.5 Flash               ║[/bold magenta]\n"
+        "[bold magenta]╚═══════════════════════════════════════════════════╝[/bold magenta]\n\n"
+        "[white]Transform Google Meet calls into actionable[/white]\n"
+        "[white]notes, summaries, and captions instantly.[/white]\n\n"
+        "[dim]Output: ./output/ai_caption.txt, ai_summary.txt, ai_notes.txt[/dim]",
+        border_style="magenta"
+    ))
     
-    Sarah: Great. Let's also not forget about the API documentation. Developers have been complaining.
+    console.print("\n[bold cyan]Select Mode:[/bold cyan]")
+    console.print("  [bold green][1][/bold green] 🎤 [bold]LIVE MODE[/bold] - Capture audio from Google Meet")
+    console.print("      [dim]→ Listens to your meeting in real-time[/dim]")
+    console.print("  [bold yellow][2][/bold yellow] 📄 [bold]DEMO MODE[/bold] - Process sample transcript")
+    console.print("      [dim]→ Shows output format without audio[/dim]")
     
-    Mike: I can assign that to the junior devs as a side project.
+    console.print("\n[cyan]Enter 1 or 2:[/cyan] ", end="")
     
-    John: Good idea. So to summarize - mobile performance first, dashboard research ongoing, and API docs as a side task.
-    
-    Sarah: Exactly. Let's reconvene in two weeks to check progress. Meeting adjourned.
-    """
-    
-    analyzer = MeetingAnalyzer()
-    
-    with console.status("[bold green]Analyzing meeting with Gemini 2.5 Flash..."):
-        caption = analyzer.generate_caption(sample_transcript)
-        summary = analyzer.generate_summary(sample_transcript)
-        action_items = analyzer.extract_action_items(sample_transcript)
-    
-    # Display results
-    display_results(caption, summary, action_items)
-    
-    # Save notes
-    transcript_file, notes_file, json_file = save_meeting_notes(
-        sample_transcript, caption, summary, action_items
-    )
-    
-    console.print(f"\n[green]✓ Meeting notes saved:[/green]")
-    console.print(f"  • Transcript: {transcript_file}")
-    console.print(f"  • Notes: {notes_file}")
-    console.print(f"  • Data: {json_file}")
+    try:
+        choice = input().strip()
+        
+        if choice == "1":
+            if AUDIO_OK:
+                run_live_demo()
+            else:
+                console.print("\n[red]❌ Audio libraries not installed![/red]")
+                console.print("\n[yellow]To enable live mode, run:[/yellow]")
+                console.print("[bold]  pip install sounddevice numpy[/bold]")
+                console.print("\n[dim]Running demo mode instead...[/dim]\n")
+                time.sleep(2)
+                run_demo_mode()
+        else:
+            run_demo_mode()
+            
+    except KeyboardInterrupt:
+        console.print("\n\n[yellow]Cancelled by user.[/yellow]")
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        import traceback
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
 
 if __name__ == "__main__":
-    run_demo()
+    main()

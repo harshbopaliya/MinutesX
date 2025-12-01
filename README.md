@@ -295,7 +295,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 👥 Authors
 
-- Your Name — @yourhandle
+- Harsh Bopaliya — @yourhandle
 
 ---
 
